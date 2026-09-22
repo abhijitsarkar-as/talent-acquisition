@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "server",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "C:\\Abhijit\\Claude Workspace\\Code-Workspace\\Talent acquisition\\.claude\\dev-server.cmd"],
+      "port": 4100
+    },
+    {
+      "name": "client",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "C:\\Abhijit\\Claude Workspace\\Code-Workspace\\Talent acquisition\\.claude\\dev-client.cmd"],
+      "port": 5174
+    }
+  ]
+}

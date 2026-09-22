@@ -1,0 +1,536 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// M1 slice: full RBAC (User + manager self-relation) and the skill taxonomy tree.
+// Everything else (WorkflowDefinition/Stage/Transition, StateTransitionEvent,
+// Requisition, Candidate, ...) is added starting in M2, per the milestone plan.
+enum UserRole {
+  RECRUITER
+  HIRING_MANAGER
+  INTERVIEWER
+  TA_LEAD
+  HRBP
+  ADMIN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole
+  managerId    String?
+  manager      User?    @relation("ManagerReports", fields: [managerId], references: [id])
+  reports      User[]   @relation("ManagerReports")
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  requisitionsOwned   Requisition[] @relation("RecruiterOwner")
+  requisitionsManaged Requisition[] @relation("HiringManager")
+  stateTransitions    StateTransitionEvent[] @relation("TransitionActor")
+  interviewerSkills   InterviewerSkill[]
+  panelistAssignments InterviewPanelist[] @relation("PanelistInterviewer")
+  scorecardsSubmitted Scorecard[] @relation("ScorecardSubmitter")
+  comments            Comment[]
+  notifications       Notification[]
+
+  @@map("users")
+}
+
+enum SkillNodeType {
+  CATEGORY
+  SKILL
+  PROFICIENCY_LEVEL
+}
+
+model SkillTaxonomyNode {
+  id        String            @id @default(cuid())
+  type      SkillNodeType
+  name      String
+  parentId  String?
+  parent    SkillTaxonomyNode?  @relation("Hierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children  SkillTaxonomyNode[] @relation("Hierarchy")
+  sortOrder Int               @default(0)
+  isActive  Boolean           @default(true)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  requisitionSkills     RequisitionSkill[]
+  candidateSkills       CandidateSkill[]
+  interviewerSkills     InterviewerSkill[]
+  scorecardCompetencies ScorecardCompetency[]
+
+  @@index([parentId])
+  @@map("skill_taxonomy_nodes")
+}
+
+// M2 slice: the workflow engine's config tables, the append-only audit/event
+// history it writes to, requisitions, and templates. Candidate/Application
+// (which reuse this same engine) land in M3.
+enum WorkflowEntityType {
+  REQUISITION
+  APPLICATION
+}
+
+model WorkflowDefinition {
+  id          String             @id @default(cuid())
+  name        String
+  description String?
+  entityType  WorkflowEntityType
+  isDefault   Boolean            @default(false)
+  isActive    Boolean            @default(true)
+  createdAt   DateTime           @default(now())
+
+  stages       WorkflowStage[]
+  transitions  WorkflowTransition[]
+  requisitions Requisition[]
+  applications Application[]
+
+  @@map("workflow_definitions")
+}
+
+model WorkflowStage {
+  id         String             @id @default(cuid())
+  workflowId String
+  workflow   WorkflowDefinition @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  key        String
+  label      String
+  isInitial  Boolean            @default(false)
+  isTerminal Boolean            @default(false)
+  sortOrder  Int                @default(0)
+  slaHours   Int?
+
+  transitionsFrom WorkflowTransition[] @relation("FromStage")
+  transitionsTo   WorkflowTransition[] @relation("ToStage")
+  requisitions    Requisition[]
+  applications    Application[]
+
+  @@unique([workflowId, key])
+  @@map("workflow_stages")
+}
+
+model WorkflowTransition {
+  id                   String             @id @default(cuid())
+  workflowId           String
+  workflow             WorkflowDefinition @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  fromStageId          String?
+  fromStage            WorkflowStage?     @relation("FromStage", fields: [fromStageId], references: [id])
+  toStageId            String
+  toStage              WorkflowStage      @relation("ToStage", fields: [toStageId], references: [id])
+  name                 String
+  guardKey             String?
+  requiresApprovalRole UserRole?
+  actionKeys           String[]           @default([])
+  allowedFromAnyStage  Boolean            @default(false)
+  reasonCodeRequired   Boolean            @default(false)
+
+  @@index([workflowId, fromStageId])
+  @@map("workflow_transitions")
+}
+
+// Append-only. Never updated, never deleted — the reporting source of truth.
+model StateTransitionEvent {
+  id            String             @id @default(cuid())
+  entityType    WorkflowEntityType
+  entityId      String
+  applicationId String?
+  application   Application?       @relation(fields: [applicationId], references: [id])
+  requisitionId String?
+  requisition   Requisition?       @relation(fields: [requisitionId], references: [id])
+
+  fromStageId  String?
+  toStageId    String
+  transitionId String?
+
+  actorId   String
+  actor     User     @relation("TransitionActor", fields: [actorId], references: [id])
+  actorRole UserRole
+
+  reasonCode String?
+  notes      String?
+  metadata   Json?
+
+  occurredAt DateTime @default(now())
+  recordedAt DateTime @default(now())
+
+  @@index([entityType, entityId, occurredAt])
+  @@index([requisitionId, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([toStageId, occurredAt])
+  @@map("state_transition_events")
+}
+
+enum RequisitionPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model Requisition {
+  id                String    @id @default(cuid())
+  title             String
+  department        String
+  level             String
+  employmentType    String
+  locations         String[]
+  headcount         Int       @default(1)
+  budgetMin         Decimal?  @db.Money
+  budgetMax         Decimal?  @db.Money
+  priority          RequisitionPriority @default(MEDIUM)
+  targetOnboardDate DateTime?
+
+  currentStageId String?
+  currentStage   WorkflowStage? @relation(fields: [currentStageId], references: [id])
+  workflowId     String
+  workflow       WorkflowDefinition @relation(fields: [workflowId], references: [id])
+
+  jdTemplateId String?
+  jdTemplate   Template? @relation("JDTemplate", fields: [jdTemplateId], references: [id])
+  jdSnapshot   String?
+
+  recruiterOwnerId String
+  recruiterOwner   User   @relation("RecruiterOwner", fields: [recruiterOwnerId], references: [id])
+  hiringManagerId  String
+  hiringManager    User   @relation("HiringManager", fields: [hiringManagerId], references: [id])
+
+  clonedFromId String?
+  clonedFrom   Requisition?  @relation("ClonedFrom", fields: [clonedFromId], references: [id])
+  clones       Requisition[] @relation("ClonedFrom")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requiredSkills RequisitionSkill[]
+  stateEvents    StateTransitionEvent[]
+  applications   Application[]
+
+  @@index([recruiterOwnerId])
+  @@index([hiringManagerId])
+  @@map("requisitions")
+}
+
+model RequisitionSkill {
+  id             String      @id @default(cuid())
+  requisitionId  String
+  requisition    Requisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  skillNodeId    String
+  skillNode      SkillTaxonomyNode @relation(fields: [skillNodeId], references: [id], onDelete: Restrict)
+  isRequired     Boolean     @default(true)
+  minProficiency String?
+
+  @@unique([requisitionId, skillNodeId])
+  @@map("requisition_skills")
+}
+
+enum TemplateType {
+  JD
+  EMAIL
+  OFFER_LETTER
+}
+
+model Template {
+  id           String       @id @default(cuid())
+  type         TemplateType
+  name         String
+  roleFamily   String?
+  region       String?
+  language     String       @default("en")
+  body         String
+  mergeFields  String[]     @default([])
+  version      Int          @default(1)
+  isApproved   Boolean      @default(false)
+  approvedById String?
+  approvedAt   DateTime?
+  supersedesId String?
+  ownerId      String
+  createdAt    DateTime     @default(now())
+
+  requisitionsUsingAsJD Requisition[] @relation("JDTemplate")
+  offers                Offer[]
+
+  @@index([type, name])
+  @@map("templates")
+}
+
+// M3 slice: candidates, applications (candidate <-> requisition, reusing the
+// same workflow engine as requisitions via WorkflowEntityType.APPLICATION),
+// and candidate skill tagging.
+enum SkillTagSource {
+  SELF_REPORTED
+  PARSED
+  INTERVIEWER_VALIDATED
+}
+
+model Candidate {
+  id              String   @id @default(cuid())
+  firstName       String
+  lastName        String
+  email           String   @unique
+  phone           String?
+  resumeUrl       String?
+  resumeHash      String?  @unique
+  parsedSkillsRaw Json?
+  sourceChannel   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  skills       CandidateSkill[]
+  applications Application[]
+  comments     Comment[]
+
+  @@index([email])
+  @@map("candidates")
+}
+
+model CandidateSkill {
+  id          String         @id @default(cuid())
+  candidateId String
+  candidate   Candidate      @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  skillNodeId String
+  skillNode   SkillTaxonomyNode @relation(fields: [skillNodeId], references: [id], onDelete: Restrict)
+  source      SkillTagSource
+  proficiency String?
+  confidence  Float?
+
+  @@unique([candidateId, skillNodeId, source])
+  @@map("candidate_skills")
+}
+
+model Application {
+  id            String      @id @default(cuid())
+  candidateId   String
+  candidate     Candidate   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  requisitionId String
+  requisition   Requisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  workflowId    String
+  workflow      WorkflowDefinition @relation(fields: [workflowId], references: [id])
+
+  currentStageId String
+  currentStage   WorkflowStage @relation(fields: [currentStageId], references: [id])
+  status         String
+  isActive       Boolean       @default(true)
+
+  appliedAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stateEvents StateTransitionEvent[]
+  interviews  Interview[]
+  offers      Offer[]
+  comments    Comment[]
+
+  @@unique([candidateId, requisitionId])
+  @@index([requisitionId, status])
+  @@index([currentStageId])
+  @@map("applications")
+}
+
+// M4 slice: interviews, panel assignment (skill-matched via InterviewerSkill),
+// scorecards, and offers.
+model InterviewerSkill {
+  id              String @id @default(cuid())
+  userId          String
+  user            User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skillNodeId     String
+  skillNode       SkillTaxonomyNode @relation(fields: [skillNodeId], references: [id], onDelete: Restrict)
+  competencyLevel String?
+
+  @@unique([userId, skillNodeId])
+  @@map("interviewer_skills")
+}
+
+model Interview {
+  id             String      @id @default(cuid())
+  applicationId  String
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  stageLabel     String
+  scheduledStart DateTime
+  scheduledEnd   DateTime
+  location       String?
+  createdAt      DateTime    @default(now())
+
+  panelists InterviewPanelist[]
+
+  @@index([applicationId])
+  @@map("interviews")
+}
+
+enum PanelistStatus {
+  ASSIGNED
+  SCORECARD_SUBMITTED
+  CANCELLED
+}
+
+model InterviewPanelist {
+  id            String         @id @default(cuid())
+  interviewId   String
+  interview     Interview      @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  interviewerId String
+  interviewer   User           @relation("PanelistInterviewer", fields: [interviewerId], references: [id])
+  status        PanelistStatus @default(ASSIGNED)
+
+  scorecard Scorecard?
+
+  @@unique([interviewId, interviewerId])
+  @@map("interview_panelists")
+}
+
+model ScorecardTemplate {
+  id           String   @id @default(cuid())
+  name         String
+  version      Int      @default(1)
+  isApproved   Boolean  @default(false)
+  competencies Json
+  createdAt    DateTime @default(now())
+
+  scorecards Scorecard[]
+
+  @@map("scorecard_templates")
+}
+
+enum ScorecardRecommendation {
+  STRONG_HIRE
+  HIRE
+  NO_HIRE
+  STRONG_NO_HIRE
+}
+
+model Scorecard {
+  id             String                   @id @default(cuid())
+  panelistId     String                   @unique
+  panelist       InterviewPanelist        @relation(fields: [panelistId], references: [id], onDelete: Cascade)
+  templateId     String
+  template       ScorecardTemplate        @relation(fields: [templateId], references: [id])
+  submittedById  String
+  submittedBy    User                     @relation("ScorecardSubmitter", fields: [submittedById], references: [id])
+  recommendation ScorecardRecommendation
+  submittedAt    DateTime?
+  createdAt      DateTime                 @default(now())
+
+  competencyRatings ScorecardCompetency[]
+
+  @@map("scorecards")
+}
+
+model ScorecardCompetency {
+  id          String    @id @default(cuid())
+  scorecardId String
+  scorecard   Scorecard @relation(fields: [scorecardId], references: [id], onDelete: Cascade)
+  skillNodeId String
+  skillNode   SkillTaxonomyNode @relation(fields: [skillNodeId], references: [id])
+  rating      Int
+  comments    String?
+
+  @@map("scorecard_competencies")
+}
+
+enum OfferStatus {
+  DRAFT
+  PENDING_APPROVAL
+  EXTENDED
+  NEGOTIATING
+  ACCEPTED
+  DECLINED
+  RESCINDED
+}
+
+model Offer {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  templateId    String
+  template      Template    @relation(fields: [templateId], references: [id])
+  status        OfferStatus @default(DRAFT)
+  compensation  Json
+
+  eSignatureRef String?
+  extendedAt    DateTime?
+  respondedAt   DateTime?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  approvals OfferApproval[]
+
+  @@map("offers")
+}
+
+enum ApprovalStepStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SKIPPED
+}
+
+model OfferApproval {
+  id           String              @id @default(cuid())
+  offerId      String
+  offer        Offer               @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  approverRole UserRole
+  approverId   String?
+  status       ApprovalStepStatus  @default(PENDING)
+  sequence     Int
+  decidedAt    DateTime?
+  notes        String?
+
+  @@index([offerId])
+  @@map("offer_approvals")
+}
+
+// M6 slice: collaboration (comments/@mentions) and notifications
+// (in-app + email adapter, wired into workflow.actions.ts's NOTIFY:* keys,
+// plus SLA breach checks against WorkflowStage.slaHours).
+model Comment {
+  id               String       @id @default(cuid())
+  candidateId      String?
+  candidate        Candidate?   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  applicationId    String?
+  application      Application? @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  authorId         String
+  author           User         @relation(fields: [authorId], references: [id])
+  body             String
+  mentionedUserIds String[]     @default([])
+  createdAt        DateTime     @default(now())
+
+  @@map("comments")
+}
+
+enum NotificationType {
+  STAGE_CHANGE
+  SLA_BREACH
+  PENDING_APPROVAL
+  MENTION
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  payload   Json
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// M5 slice: custom report builder's saved filter sets. The reporting
+// queries themselves read directly from StateTransitionEvent via raw SQL
+// (window functions) rather than an ORM-mapped model.
+model SavedReport {
+  id        String   @id @default(cuid())
+  ownerId   String
+  name      String
+  filters   Json
+  schedule  Json?
+  createdAt DateTime @default(now())
+
+  @@map("saved_reports")
+}

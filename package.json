@@ -1,0 +1,24 @@
+{
+  "name": "talent-acquisition",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": ["packages/shared", "server", "client"],
+  "scripts": {
+    "dev": "concurrently -n shared,server,client -c yellow,blue,green \"npm run dev -w packages/shared\" \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w packages/shared && npm run build -w server && npm run build -w client",
+    "prisma:migrate": "npm run prisma:migrate -w server",
+    "prisma:seed": "npm run prisma:seed -w server",
+    "prisma:studio": "npm run prisma:studio -w server",
+    "db:reset": "npm run db:reset -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "allowScripts": {
+    "@prisma/client@5.22.0": true,
+    "@prisma/engines@5.22.0": true,
+    "esbuild@0.28.1": true,
+    "esbuild@0.21.5": true,
+    "prisma@5.22.0": true
+  }
+}
